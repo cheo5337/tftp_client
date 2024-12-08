@@ -31,7 +31,7 @@ ERR = {
 def get_err(recv_msg:bytearray) -> None:
     '''에러 메시지를 처리하고 Exception 발생.
 
-    클라이언트가 OP Code가 5(Error)를 수신했을 때 호출되어
+    클라이언트가 OP Code 5(Error)를 수신했을 때 호출되어
     main() 함수의 except 블록이 처리할 수 있는 에러 메시지를 포함한 Exception을 발생시키고
     현재 송수신을 종료시킵니다.
 
@@ -99,7 +99,7 @@ class TftpSocket(socket.socket):
         MAX_RETRY (int): 최대 재전송 허용 횟수. 
         BASETIME (float): timeout시 재전송 간격 기본 단위.
         retries (int): 마지막 송신 메시지의 재전송 횟수.
-        timer (threading.Timer): 재전송 시간을 관리하는 타이머.
+        timer (threading.Timer): 재전송 대기 시간을 관리하는 타이머.
         lock (threading.Lock): timer 관리를 위한 lock.
         is_not_respond (threading.Event): 최대 재전송 횟수를 넘어 전송에 실패했음을 표시하는 flag.
         prev_msg (tuple(data, address)): 직전에 sendto()로 송신한 데이터와 소켓 주소.
@@ -116,10 +116,10 @@ class TftpSocket(socket.socket):
         self.is_not_respond = threading.Event()
 
     def __start_timer(self) -> None:
-        '''재전송 timeout 확인을 위한 타이머 생성.
+        '''수신 대기를 위한 타이머 생성.
 
-        현재 재전송 횟수(retries)에 기반해 exponetial backoff에 따라 대기하는 타이머를 생성 및 시작합니다.
-        - 2^(retries) * BASETIME
+        현재 재전송 횟수(retries)를 따라 증가하는 exponential backoff에 기반한 타이머를 생성 및 시작합니다.
+        - 대기 시간: 2^(retries) * BASETIME
         '''
         with self.lock():
             if self.timer:
@@ -132,8 +132,9 @@ class TftpSocket(socket.socket):
             self.timer.start()
 
     def __timeout(self) -> None:
-        '''timer 만료시 재전송하거나 전송 실패 처리.
-
+        '''수신 대기 타이머 만료시 처리
+        
+        타이머에 callback으로 전달되어 타이머 만료시 호출됩니다.
         현재 재전송 횟수(retries)가 최대 재전송 횟수(MAX_RETRY) 보다 작은 경우 메시지를 재전송합니다.
         그렇지 않은 경우 전송 실패 플래그(is_not_respond)를 활성화합니다.
         '''
@@ -367,7 +368,7 @@ def main(args:argparse.Namespace) -> None:
                     elif answer == "y":
                         break
             
-            # TFTP get 수행 후 파일 저장
+            # TFTP get 수행 후 수신한 바이너리 데이터를 파일로 저장
             recv_file = get(sock, socket_addr, file_name)
             with open(file_name, "wb") as file:
                 file.write(recv_file)
