@@ -97,13 +97,12 @@ class TftpSocket(socket.socket):
     '''
     def __init__(self) -> None:
         super().__init__(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.setblocking(False)
 
         self.MAX_RETRY = 5
         self.BASETIME = 0.2
         self.retries = 0
 
-    def __get_timeout(self) -> float:
+    def __get_timer(self) -> float:
         '''수신 대기 타이머 값 계산
 
         지수 백오프에 기반한 재전송 시간을 반환합니다.
@@ -114,12 +113,12 @@ class TftpSocket(socket.socket):
     def __timeout(self) -> None:
         '''수신 대기 타이머 만료시 처리
 
-        재전송 타이머에 callback으로 전달되어 타이머 만료시 호출됩니다.
+        타이머 만료시 호출됩니다.
         현재 재전송 횟수(retries)가 최대 재전송 횟수(MAX_RETRY) 보다 작은 경우 메시지를 재전송합니다.
-        그렇지 않은 경우 socket을 닫고 TimeoutError를 발생시킵니다.
+        그렇지 않은 경우 socket을 닫고 socket.timeout를 발생시킵니다.
 
         Raises:
-            TimeoutError: 최대 재전송 횟수에 도달한 경우 발생
+            socket.timeout: 최대 재전송 횟수에 도달한 경우 발생
         '''
         if self.retries < self.MAX_RETRY:
             # 재전송 횟수 가산
@@ -136,7 +135,6 @@ class TftpSocket(socket.socket):
         '''메시지 송신
 
         송신할 튜플(data, address)을 prev_msg에 저장하고 sendto로 송신합니다.
-        __start_timer()를 호출해 타이머를 시작합니다.
 
         Args:
             data: 송신할 바이트 메시지.
@@ -150,7 +148,7 @@ class TftpSocket(socket.socket):
         return super().sendto(data, address)
 
     def recv_msg(self, target_code:bytes, target_block:int, bufsize: int) -> tuple:
-        '''메시지 수신 대기
+        '''메시지 수신
 
         현재 순서에서 수신해야 할 메시지를 대기하고 목표한 메시지를 수신한 경우 반환합니다.
 
@@ -161,15 +159,19 @@ class TftpSocket(socket.socket):
 
         Returns:
             (수신 메시지, 수신 주소) 튜플
+
+        Raises:
+            socket.timeout: 시간 내 정상 응답이 수신되지 않을 경우 발생
+            Exception: 서버로부터 에러 메시지를 수신할 경우 발생
         '''
 
-        timeout = self.__get_timeout()
-        started_at = time.time()
+        timeout:float = self.__get_timer()
+        started_at:float = time.time()
 
-        # 정해진 timeout 시간동안 대기하며 메시지를 수신
+        # 정해진 timeout 시간 동안 대기하며 메시지를 수신
         while 1:
             # timeout 시간이 얼마나 남았는지 계산
-            time_remain = timeout - (time.time() - started_at)
+            time_remain:float = timeout - (time.time() - started_at)
             
             # 남은 시간이 있으면 socket의 timeout을 남은 시간으로 설정
             if time_remain > 0:
@@ -180,7 +182,7 @@ class TftpSocket(socket.socket):
                 raise socket.timeout
 
             # 남은 시간만큼 메시지 수신을 blocking
-            # 남은 시간동안 메시지를 수신하지 못하면 socket.timeout을 발생
+            # 남은 시간 동안 메시지를 수신하지 못하면 socket.timeout을 발생
             recv_msg, addr = self.recvfrom(bufsize)
             
             # 시간 내에 수신한 메시지가 목표 메시지인 경우 해당 메시지를 반환
@@ -205,11 +207,17 @@ class TftpSocket(socket.socket):
 
         Returns:
             수신 메시지, 수신 주소 튜플
+
+        Raises:
+            socket.timeout: 최대 재전송 횟수에 도달한 경우 발생
+            Exception: 서버로부터 에러 메시지를 수신할 경우 발생
         '''
 
+        # 최대 재전송 횟수에 도달하거나 목표 메시지가 수신될 때까지 반복적으로 수신 및 재전송
         while 1:
             try:
                 return self.recv_msg(target_code, target_block, bufsize)
+            # timeout을 관리하고 에러 메시지 수신은 상위 스택으로 예외 전파
             except socket.timeout:
                 self.__timeout()
 
@@ -225,7 +233,7 @@ def get(sock:TftpSocket, socket_addr:tuple, file_name:str) -> bytearray:
         수신한 파일 바이너리
 
     Raises:
-        TimeoutError: 시간 내 정상 응답이 수신되지 않을 경우 발생
+        socket.timeout: 시간 내 정상 응답이 수신되지 않을 경우 발생
         Exception: 서버로부터 에러 메시지를 수신할 경우 발생
     '''
     # 수신할 파일 바이너리
@@ -242,6 +250,7 @@ def get(sock:TftpSocket, socket_addr:tuple, file_name:str) -> bytearray:
         recv_msg, addr = sock.receive(OP_CODE["DATA"], block_num, 516)
         recv_msg = bytearray(recv_msg)
 
+        # 해당 블록 ACK을 송신하고 블록 번호 가산
         sock.sendto(ack_msg(block_num), addr)
         block_num += 1
 
@@ -262,7 +271,7 @@ def put(sock:TftpSocket, socket_addr:tuple, file_name:str, send_file:bytearray) 
         send_file: 송신할 파일 바이너리
 
     Raises:
-        TimeoutError: 시간 내 정상 응답이 수신되지 않을 경우 발생
+        socket.timeout: 시간 내 정상 응답이 수신되지 않을 경우 발생
         Exception: 서버로부터 에러 메시지를 수신할 경우 발생
     '''
 
@@ -280,7 +289,7 @@ def put(sock:TftpSocket, socket_addr:tuple, file_name:str, send_file:bytearray) 
         recv_msg, addr = sock.receive(OP_CODE["ACK"], block_num, 516)
         recv_msg = bytearray(recv_msg)
         
-        # 다음 블록을 송신
+        # 현재 블록 번호를 가산하고 다음 블록을 송신
         block_num += 1
         msg = data_msg(block_num, send_file[512*(block_num-1):512*(block_num)])
         sock.sendto(msg, addr)
