@@ -2,11 +2,9 @@ import socket
 from struct import pack
 from ipaddress import ip_address
 import argparse
-import threading
-import select
 import os
-import asyncio
 from random import random
+import time
 
 # TFTP 메시지 송수신에 사용하는 OP CODE 상수 선언
 OP_CODE = {
@@ -105,14 +103,13 @@ class TftpSocket(socket.socket):
         self.BASETIME = 0.2
         self.retries = 0
 
-    async def __start_timer(self) -> None:
-        '''수신 대기 타이머 설정
+    def __get_timeout(self) -> float:
+        '''수신 대기 타이머 값 계산
 
-        지수 백오프에 기반한 재전송 시간만큼 대기합니다.
+        지수 백오프에 기반한 재전송 시간을 반환합니다.
         (단위시간 * 2^(현재 재전송 횟수) + 무작위 밀리초 지연)
         '''
-        interval = 2 ** self.retries * self.BASETIME + (random() / 100)
-        await asyncio.sleep(interval)
+        return 2 ** self.retries * self.BASETIME + (random() / 100)
 
     def __timeout(self) -> None:
         '''수신 대기 타이머 만료시 처리
@@ -133,7 +130,7 @@ class TftpSocket(socket.socket):
             return
         else:
             # 최대 재전송 횟수 도달시 예외 발생
-            raise TimeoutError("The server not respond.")
+            raise socket.timeout("The server not respond.")
 
     def sendto(self, data:bytes, address:tuple) -> int:
         '''메시지 송신
@@ -152,7 +149,7 @@ class TftpSocket(socket.socket):
         self.prev_msg = (data, address)
         return super().sendto(data, address)
 
-    async def recv_msg(self, target_code:bytes, target_block:int, bufsize: int) -> tuple:
+    def recv_msg(self, target_code:bytes, target_block:int, bufsize: int) -> tuple:
         '''메시지 수신 대기
 
         현재 순서에서 수신해야 할 메시지를 대기하고 목표한 메시지를 수신한 경우 반환합니다.
@@ -163,27 +160,39 @@ class TftpSocket(socket.socket):
             bufsize: 수신할 버퍼 크기
 
         Returns:
-            수신 메시지, 수신 주소 튜플
+            (수신 메시지, 수신 주소) 튜플
         '''
-        loop = asyncio.get_running_loop()
 
-        # receive에서 task를 cancel할 때까지 반복적으로 메시지를 확인합니다.
+        timeout = self.__get_timeout()
+        started_at = time.time()
+
+        # 정해진 timeout 시간동안 대기하며 메시지를 수신
         while 1:
-            try:
-                recv_msg, addr = await loop.run_in_executor(None, self.recvfrom, bufsize)
-                
-                # 수신한 메시지가 목표 메시지인 경우 해당 메시지를 반환합니다.
-                if (recv_msg[0:2] == target_code):
-                    if (int.from_bytes(recv_msg[2:4], "big") == target_block):
-                        return (recv_msg, addr)
-                # 수신한 메시지가 에러 메시지인 경우 get_err를 호출합니다.
-                elif (recv_msg[0:2] == OP_CODE["ERROR"]):
-                    get_err(int.from_bytes(recv_msg[2:4], "big"))
-            except BlockingIOError:
-                pass
+            # timeout 시간이 얼마나 남았는지 계산
+            time_remain = timeout - (time.time() - started_at)
+            
+            # 남은 시간이 있으면 socket의 timeout을 남은 시간으로 설정
+            if time_remain > 0:
+                self.settimeout(time_remain)
+
+            # 남은 시간이 없으면 socket.timeout을 발생
+            else:
+                raise socket.timeout
+
+            # 남은 시간만큼 메시지 수신을 blocking
+            # 남은 시간동안 메시지를 수신하지 못하면 socket.timeout을 발생
+            recv_msg, addr = self.recvfrom(bufsize)
+            
+            # 시간 내에 수신한 메시지가 목표 메시지인 경우 해당 메시지를 반환
+            if (recv_msg[0:2] == target_code):
+                if (int.from_bytes(recv_msg[2:4], "big") == target_block):
+                    return (recv_msg, addr)
+            # 수신한 메시지가 에러 메시지인 경우 get_err를 호출
+            elif (recv_msg[0:2] == OP_CODE["ERROR"]):
+                get_err(int.from_bytes(recv_msg[2:4], "big"))
 
 
-    async def receive(self, target_code:bytes, target_block:int, bufsize: int) -> tuple:
+    def receive(self, target_code:bytes, target_block:int, bufsize: int) -> tuple:
         '''메시지 수신
 
         메시지를 수신 대기하고 정해진 시간 내에 목표 메시지를 수신하지 못한 경우 __timeout()을 호출합니다.
@@ -198,44 +207,13 @@ class TftpSocket(socket.socket):
             수신 메시지, 수신 주소 튜플
         '''
 
-        # 수신과 타이머를 task로 설정
-        receive = asyncio.create_task(self.recv_msg(target_code, target_block, bufsize))
-        timer = asyncio.create_task(self.__start_timer())
-
-        # 수신과 타이머 중 먼저 완료되는 것을 대기
-        done, pending = await asyncio.wait(
-            [receive, timer],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        try:
-            # 타이머가 완료된 시점에서 목표 메시지가 수신되지 않은 경우
-            if timer in done:
-                # 현재 수신 작업을 취소하고 timeout을 호출
-                receive.cancel()
+        while 1:
+            try:
+                return self.recv_msg(target_code, target_block, bufsize)
+            except socket.timeout:
                 self.__timeout()
 
-                # 최대 재전송 횟수보다 현재 재전송 횟수가 작은 경우 receive를 재귀 호출
-                return await self.receive(target_code, target_block, bufsize)
-
-            # 타이머가 완료되기 전 목표 메시지가 수신된 경우
-            elif receive in done:
-                # 현재 타이머를 취소하고 현재 재전송 횟수를 0으로 초기화
-                timer.cancel()
-                self.retries = 0
-
-                #수신 데이터 반환
-                return receive.result()
-        finally:
-            # 만약 취소되지 않은 작업이 있는 경우 취소
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-
-async def get(sock:TftpSocket, socket_addr:tuple, file_name:str) -> bytearray:
+def get(sock:TftpSocket, socket_addr:tuple, file_name:str) -> bytearray:
     '''TFTP get 통신 수행
 
     Args:
@@ -261,7 +239,7 @@ async def get(sock:TftpSocket, socket_addr:tuple, file_name:str) -> bytearray:
 
     while 1:
         # 수신한 메시지와 소켓 주소를 recv_msg와 addr로 저장
-        recv_msg, addr = await sock.receive(OP_CODE["DATA"], block_num, 516)
+        recv_msg, addr = sock.receive(OP_CODE["DATA"], block_num, 516)
         recv_msg = bytearray(recv_msg)
 
         sock.sendto(ack_msg(block_num), addr)
@@ -274,7 +252,7 @@ async def get(sock:TftpSocket, socket_addr:tuple, file_name:str) -> bytearray:
 
     return recv_file
 
-async def put(sock:TftpSocket, socket_addr:tuple, file_name:str, send_file:bytearray) -> None:
+def put(sock:TftpSocket, socket_addr:tuple, file_name:str, send_file:bytearray) -> None:
     '''TFTP put 통신 수행
 
     Args:
@@ -299,7 +277,7 @@ async def put(sock:TftpSocket, socket_addr:tuple, file_name:str, send_file:bytea
 
     # 현재 블록 번호가 송신할 마지막 블록 번호보다 작은 동안
     while block_num < block_amount:
-        recv_msg, addr = await sock.receive(OP_CODE["ACK"], block_num, 516)
+        recv_msg, addr = sock.receive(OP_CODE["ACK"], block_num, 516)
         recv_msg = bytearray(recv_msg)
         
         # 다음 블록을 송신
@@ -335,17 +313,8 @@ def main(args:argparse.Namespace) -> None:
 
     try:
         if mode == "get":
-            # 경로에 저장할 파일이 이미 존재하는 경우 덮어쓰기 확인
-            if os.path.isfile(file_name):
-                while 1:
-                    answer = input(f"There's aleady exists file \'{file_name}\'. Do you replace it? (y/n) ")
-                    if answer == "n":
-                        return
-                    elif answer == "y":
-                        break
-
             # TFTP get 수행 후 수신한 바이너리 데이터를 파일로 저장
-            recv_file = asyncio.run(get(sock, socket_addr, file_name))
+            recv_file = get(sock, socket_addr, file_name)
             with open(file_name, "wb") as file:
                 file.write(recv_file)
         else:
@@ -356,7 +325,7 @@ def main(args:argparse.Namespace) -> None:
             # 파일을 불러온 후 TFTP put 수행
             with open(file_name, "rb") as file:
                 send_file = bytearray(file.read())
-            asyncio.run(put(sock, socket_addr, file_name, send_file))
+            put(sock, socket_addr, file_name, send_file)
 
     # 예외 발생시 오류 메시지 출력
     except Exception as e:
